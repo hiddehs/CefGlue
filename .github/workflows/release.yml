@@ -102,3 +102,56 @@ jobs:
         with:
           name: nupkgs-${{ steps.ver.outputs.pkg }}-cef${{ steps.ver.outputs.cef }}
           path: Nuget/output/*.nupkg
+
+  publish-static-feed:
+    needs: build-and-publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout workflow source (for script)
+        uses: actions/checkout@v4
+
+      - name: Checkout gh-pages branch into ./feed
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: feed
+        continue-on-error: true
+
+      - name: Initialise gh-pages working tree if branch did not exist
+        run: |
+          if [[ ! -d feed/.git ]]; then
+            rm -rf feed
+            mkdir feed
+            cd feed
+            git init -b gh-pages
+            git remote add origin "https://github.com/${{ github.repository }}.git"
+          fi
+
+      - name: Download nupkg artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: nupkgs-*
+          path: incoming
+          merge-multiple: true
+
+      - name: Regenerate static feed
+        run: |
+          python3 .github/scripts/build-static-feed.py \
+            "$PWD/incoming" \
+            "$PWD/feed" \
+            "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+
+      - name: Commit and push to gh-pages
+        working-directory: feed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No feed changes."
+            exit 0
+          fi
+          git commit -m "feed: publish release"
+          git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" gh-pages
