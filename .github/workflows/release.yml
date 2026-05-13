@@ -1,4 +1,12 @@
-name: Release packages to GitHub Packages
+name: Build release nupkgs
+
+# Produces the four nupkgs the downstream consumer (vra/server-core) vendors
+# in `vendor/cefglue/` via Git LFS. The nupkgs land on the workflow run as a
+# downloadable artifact; no NuGet feed is published. Tag a release as
+#
+#   v<pkg-version>+cef<cef-version>     e.g. v139.7258.139+cef139.0.28
+#
+# or trigger manually via workflow_dispatch.
 
 on:
   workflow_dispatch:
@@ -17,10 +25,9 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
-  build-and-publish:
+  build:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -37,7 +44,6 @@ jobs:
             CEF_VERSION="${{ inputs.cef-version }}"
             PKG_VERSION="${{ inputs.package-version }}"
           else
-            # Tag form: v<pkg-version>+cef<cef-version>, e.g. v139.7258.139+cef139.0.28
             REF="${GITHUB_REF#refs/tags/v}"
             PKG_VERSION="${REF%+cef*}"
             CEF_VERSION="${REF#*+cef}"
@@ -52,9 +58,8 @@ jobs:
           mkdir -p Nuget/output
           tools/build-osx-arm64-redist.sh "${{ steps.ver.outputs.cef }}" "$PWD/Nuget/output"
 
-      - name: Configure NuGet to consume the local redist feed
+      - name: Configure NuGet to consume the freshly built redist
         run: |
-          # Make the freshly built cef.redist.osx.arm64 visible to dotnet restore.
           cat > NuGet.config <<EOF
           <?xml version="1.0" encoding="utf-8"?>
           <configuration>
@@ -69,14 +74,19 @@ jobs:
           </configuration>
           EOF
 
-      - name: Build CefGlue.Common (ARM64)
+      - name: Build Xilium.CefGlue
+        run: |
+          dotnet build CefGlue/CefGlue.csproj -c Release -p:Platform=ARM64 \
+            -p:Version=${{ steps.ver.outputs.pkg }}
+
+      - name: Build CefGlue.Common.ARM64 (macOS arm64 + Windows arm64)
         run: |
           dotnet build CefGlue.Common/CefGlue.Common.csproj -c Release -p:Platform=ARM64 \
             -p:Version=${{ steps.ver.outputs.pkg }} \
             -p:CefRedistVersion=${{ steps.ver.outputs.cef }} \
             -p:CefRedistOSXVersion=${{ steps.ver.outputs.cef }}
 
-      - name: Build CefGlue.Common (x64 / Windows)
+      - name: Build CefGlue.Common (Windows x64)
         run: |
           dotnet build CefGlue.Common/CefGlue.Common.csproj -c Release -p:Platform=x64 \
             -p:Version=${{ steps.ver.outputs.pkg }} \
@@ -85,73 +95,9 @@ jobs:
       - name: List built packages
         run: ls -lh Nuget/output
 
-      - name: Push to GitHub Packages
-        env:
-          GH_PACKAGES_PAT: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          for nupkg in Nuget/output/*.nupkg; do
-            echo "Pushing $nupkg"
-            dotnet nuget push "$nupkg" \
-              --source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" \
-              --api-key "$GH_PACKAGES_PAT" \
-              --skip-duplicate
-          done
-
       - name: Upload nupkgs as workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: nupkgs-${{ steps.ver.outputs.pkg }}-cef${{ steps.ver.outputs.cef }}
           path: Nuget/output/*.nupkg
-
-  publish-static-feed:
-    needs: build-and-publish
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout workflow source (for script)
-        uses: actions/checkout@v4
-
-      - name: Checkout gh-pages branch into ./feed
-        uses: actions/checkout@v4
-        with:
-          ref: gh-pages
-          path: feed
-        continue-on-error: true
-
-      - name: Initialise gh-pages working tree if branch did not exist
-        run: |
-          if [[ ! -d feed/.git ]]; then
-            rm -rf feed
-            mkdir feed
-            cd feed
-            git init -b gh-pages
-            git remote add origin "https://github.com/${{ github.repository }}.git"
-          fi
-
-      - name: Download nupkg artifact
-        uses: actions/download-artifact@v4
-        with:
-          pattern: nupkgs-*
-          path: incoming
-          merge-multiple: true
-
-      - name: Regenerate static feed
-        run: |
-          python3 .github/scripts/build-static-feed.py \
-            "$PWD/incoming" \
-            "$PWD/feed" \
-            "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
-
-      - name: Commit and push to gh-pages
-        working-directory: feed
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No feed changes."
-            exit 0
-          fi
-          git commit -m "feed: publish release"
-          git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" gh-pages
+          retention-days: 90
