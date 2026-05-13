@@ -1,0 +1,104 @@
+name: Release packages to GitHub Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      cef-version:
+        description: "CEF version (matches Spotify CDN, e.g. 139.0.28)"
+        required: true
+        default: "139.0.28"
+      package-version:
+        description: "CefGlue package version (e.g. 139.7258.139)"
+        required: true
+        default: "139.7258.139"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-publish:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Resolve versions
+        id: ver
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            CEF_VERSION="${{ inputs.cef-version }}"
+            PKG_VERSION="${{ inputs.package-version }}"
+          else
+            # Tag form: v<pkg-version>+cef<cef-version>, e.g. v139.7258.139+cef139.0.28
+            REF="${GITHUB_REF#refs/tags/v}"
+            PKG_VERSION="${REF%+cef*}"
+            CEF_VERSION="${REF#*+cef}"
+          fi
+          echo "cef=$CEF_VERSION" >> "$GITHUB_OUTPUT"
+          echo "pkg=$PKG_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building CefGlue $PKG_VERSION against CEF $CEF_VERSION"
+
+      - name: Repack cef.redist.osx.arm64
+        run: |
+          chmod +x tools/build-osx-arm64-redist.sh
+          mkdir -p Nuget/output
+          tools/build-osx-arm64-redist.sh "${{ steps.ver.outputs.cef }}" "$PWD/Nuget/output"
+
+      - name: Configure NuGet to consume the local redist feed
+        run: |
+          # Make the freshly built cef.redist.osx.arm64 visible to dotnet restore.
+          cat > NuGet.config <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+              <add key="local-redist" value="$PWD/Nuget/output" />
+            </packageSources>
+            <packageSourceMapping>
+              <packageSource key="nuget.org"><package pattern="*" /></packageSource>
+              <packageSource key="local-redist"><package pattern="cef.redist.*" /></packageSource>
+            </packageSourceMapping>
+          </configuration>
+          EOF
+
+      - name: Build CefGlue.Common (ARM64)
+        run: |
+          dotnet build CefGlue.Common/CefGlue.Common.csproj -c Release -p:Platform=ARM64 \
+            -p:Version=${{ steps.ver.outputs.pkg }} \
+            -p:CefRedistVersion=${{ steps.ver.outputs.cef }} \
+            -p:CefRedistOSXVersion=${{ steps.ver.outputs.cef }}
+
+      - name: Build CefGlue.Common (x64 / Windows)
+        run: |
+          dotnet build CefGlue.Common/CefGlue.Common.csproj -c Release -p:Platform=x64 \
+            -p:Version=${{ steps.ver.outputs.pkg }} \
+            -p:CefRedistVersion=${{ steps.ver.outputs.cef }}
+
+      - name: List built packages
+        run: ls -lh Nuget/output
+
+      - name: Push to GitHub Packages
+        env:
+          GH_PACKAGES_PAT: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for nupkg in Nuget/output/*.nupkg; do
+            echo "Pushing $nupkg"
+            dotnet nuget push "$nupkg" \
+              --source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" \
+              --api-key "$GH_PACKAGES_PAT" \
+              --skip-duplicate
+          done
+
+      - name: Upload nupkgs as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nupkgs-${{ steps.ver.outputs.pkg }}-cef${{ steps.ver.outputs.cef }}
+          path: Nuget/output/*.nupkg
